@@ -1,0 +1,121 @@
+apiVersion: workloads.x-k8s.io/v1alpha1
+kind: RoleBasedGroup
+metadata:
+  name: mk 
+  namespace: aiservice 
+spec:
+  roles:
+    - name: mooncake-master
+      replicas: 1
+      template:
+        spec:
+          nodeSelector:
+            maas: "yes"
+          tolerations:
+          - key: maas
+            operator: Exists
+          - key: node-role.alibabacloud.com/lingjun
+            operator: Exists
+          - key: pd_share
+            operator: Exists
+          - key: bopd
+            operator: Exists
+          - key: bo
+            operator: Exists
+          - key: oss
+            operator: Exists
+          containers:
+            - name: master
+              image: iflytek-registry-vpc.cn-beijing.cr.aliyuncs.com/maas/sglang-accl-latest:1.0.120 
+              env:
+                - name: POD_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.podIP
+              command:
+                - sh
+                - -c
+                - "mooncake_master \
+                --rpc_address $(POD_IP) --rpc_port 50051 \
+                --http_metadata_server_host $(POD_IP) --http_metadata_server_port 8080 \
+                --enable_http_metadata_server=true  \
+                --metrics_port 9003"
+              ports:
+                - containerPort: 50051
+                  name: http
+              readinessProbe:
+                initialDelaySeconds: 10
+                periodSeconds: 10
+                tcpSocket:
+                  port: 50051
+    - name: mooncake-store
+      replicas: 3
+
+      template:
+        spec:
+          nodeSelector:
+            maas: "yes"
+          tolerations:
+          - key: maas
+            operator: Exists
+          - key: node-role.alibabacloud.com/lingjun
+            operator: Exists
+          - key: pd_share
+            operator: Exists
+          - key: bopd
+            operator: Exists
+          - key: bo
+            operator: Exists
+          - key: oss
+            operator: Exists
+          hostNetwork: true
+          hostIPC: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            - emptyDir:
+                medium: Memory
+              name: dshm
+            - hostPath:
+                path: /dev/infiniband
+              name: ib
+          containers:
+            - name: store
+              image: iflytek-registry-vpc.cn-beijing.cr.aliyuncs.com/maas/sglang-accl-latest:1.0.120 
+              env:
+                - name: MOONCAKE_MASTER
+                  value: "mk-mooncake-master:50051"
+                - name: MOONCAKE_TE_META_DATA_SERVER
+                  value: "http://mk-mooncake-master:8080/metadata"
+                - name: MOONCAKE_GLOBAL_SEGMENT_SIZE
+                  value: "50gb"
+                # MOONCAKE_LOCAL_BUFFER_SIZE is set to 0 because the instance functions solely as a storage server, 
+                # contributing memory to the global pool without issuing any request operations.
+                - name: MOONCAKE_LOCAL_BUFFER_SIZE
+                  value: "4194304"
+                - name: MOONCAKE_PROTOCOL
+                  value: "rdma" #support tcp, rdma
+                - name: MOONCAKE_DEVICE
+                  value: "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3" #set rdma device if MOONCAKE_PROTOCOL=rdma is set
+              command:
+                - sh
+                - -c
+                - "python -m mooncake.mooncake_store_service"
+              securityContext:
+                capabilities:
+                  add:
+                  - IPC_LOCK
+                privileged: true
+              resources:
+                limits:
+                  memory: "52Gi"
+                  #configure rdma device if MOONCAKE_PROTOCOL=rdma is set
+                #  rdma/hca: "1"
+                requests:
+                  memory: "52Gi"
+                  #configure rdma device if MOONCAKE_PROTOCOL=rdma is set
+                 # rdma/hca: "1"
+              volumeMounts:
+                - mountPath: /dev/shm
+                  name: dshm
+                - mountPath: /dev/infiniband
+                  name: ib
