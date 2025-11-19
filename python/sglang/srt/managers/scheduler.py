@@ -137,6 +137,9 @@ from sglang.srt.managers.scheduler_metrics_mixin import (
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+from sglang.srt.managers.scheduler_pp_dynamic_chunk_mixin import (
+    SchedulerPPDynamicChunkMixin,
+)
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
@@ -147,7 +150,10 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    validate_input_length,
+)
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -218,6 +224,7 @@ class Scheduler(
     SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
+    SchedulerPPDynamicChunkMixin,
     SchedulerDPAttnMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
@@ -455,6 +462,9 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
+        
+        # Init dynamic chunk size for PP mode
+        self.init_pp_dynamic_chunk_size()
 
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
@@ -1786,6 +1796,11 @@ class Scheduler(
             # in the waiting queue.
             return None
 
+        # Dynamic chunk size adjustment for PP mode
+        dynamic_chunk_size = self.get_dynamic_chunk_size()
+        if dynamic_chunk_size is None:
+            dynamic_chunk_size = self.chunked_prefill_size
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -1794,7 +1809,7 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            dynamic_chunk_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )
@@ -1999,8 +2014,10 @@ class Scheduler(
             time.sleep(self.forward_sleep_time)
 
         # Capture prefill start time for EXTEND mode
+        chunk_start_time = None
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()
+            chunk_start_time = current_time
             for req in batch.reqs:
                 req.time_stats.prefill_start_time_host = current_time
 
@@ -2113,6 +2130,9 @@ class Scheduler(
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
             ret = EmbeddingBatchResult(embeddings=embeddings)
 
+        # Record chunk execution time for dynamic chunk size adjustment (PP mode)
+        self.record_chunk_execution_time(batch, chunk_start_time)
+        
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
             current_time = time.perf_counter()

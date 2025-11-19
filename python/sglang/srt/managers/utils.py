@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -172,3 +172,138 @@ def get_logprob_from_pp_outputs(
     ]
 
     return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
+
+
+def calculate_dynamic_chunk_size(
+    current_seq_len: int,
+    target_chunk_time: float,
+    quadratic_coeff_a: float,
+    linear_coeff_b: float,
+    min_chunk_size: int = 1,
+    max_chunk_size: Optional[int] = None,
+) -> int:
+    """
+    Calculate the next chunk size to achieve consistent chunk time in PP mode.
+    
+    Formula: x = (-(2aL+b) + sqrt((2aL+b)^2 + 4aT)) / (2a)
+    where:
+    - L: current sequence length
+    - T: target chunk time
+    - a: quadratic coefficient (from attention complexity O(n^2))
+    - b: linear coefficient
+    
+    Args:
+        current_seq_len: Current sequence length (L)
+        target_chunk_time: Target time for each chunk (T)
+        quadratic_coeff_a: Quadratic coefficient (a)
+        linear_coeff_b: Linear coefficient (b)
+        min_chunk_size: Minimum chunk size to return
+        max_chunk_size: Maximum chunk size to return (None means no limit)
+    
+    Returns:
+        Calculated chunk size (x)
+    """
+    if quadratic_coeff_a <= 0:
+        # Fallback to linear if quadratic coefficient is invalid
+        if linear_coeff_b > 0:
+            chunk_size = int(target_chunk_time / linear_coeff_b)
+        else:
+            # Default fallback
+            chunk_size = 8192
+    else:
+        # Calculate using quadratic formula: x = (-(2aL+b) + sqrt((2aL+b)^2 + 4aT)) / (2a)
+        two_a_L_plus_b = 2 * quadratic_coeff_a * current_seq_len + linear_coeff_b
+        discriminant = two_a_L_plus_b * two_a_L_plus_b + 4 * quadratic_coeff_a * target_chunk_time
+        
+        if discriminant < 0:
+            # Fallback if discriminant is negative
+            chunk_size = 8192
+        else:
+            sqrt_discriminant = discriminant ** 0.5
+            chunk_size = int((-two_a_L_plus_b + sqrt_discriminant) / (2 * quadratic_coeff_a))
+    
+    # Apply bounds
+    chunk_size = max(chunk_size, min_chunk_size)
+    if max_chunk_size is not None:
+        chunk_size = min(chunk_size, max_chunk_size)
+    
+    return chunk_size
+
+
+def fit_quadratic_coefficients(
+    seq_lens: List[int],
+    chunk_times: List[float],
+) -> Tuple[float, float]:
+    """
+    Fit quadratic coefficients from sequence lengths and chunk times.
+    
+    Model: time = a * seq_len^2 + b * seq_len + c
+    We solve for a and b using least squares.
+    
+    Args:
+        seq_lens: List of sequence lengths (L)
+        chunk_times: List of corresponding chunk execution times (T)
+    
+    Returns:
+        Tuple of (quadratic_coeff_a, linear_coeff_b)
+    """
+    if len(seq_lens) < 3:
+        # Need at least 3 points to fit quadratic model reliably
+        logger.warning(
+            f"Not enough data points for fitting ({len(seq_lens)} < 3). "
+            "Need at least 3 samples with different sequence lengths."
+        )
+        return (0.0, 0.0)
+    
+    # Convert to numpy arrays for easier computation
+    try:
+        import numpy as np
+    except ImportError:
+        logger.warning(
+            "numpy not available, cannot fit quadratic coefficients. "
+            "Please install numpy or set coefficients manually."
+        )
+        return (0.0, 0.0)
+    
+    L = np.array(seq_lens, dtype=np.float64)
+    T = np.array(chunk_times, dtype=np.float64)
+    
+    # Build design matrix for quadratic model: T = a*L^2 + b*L + c
+    # We'll solve for [a, b, c] using least squares
+    # X = [L^2, L, 1]
+    X = np.column_stack([L * L, L, np.ones(len(L))])
+    
+    # Solve: X @ [a, b, c]^T = T
+    try:
+        # Use least squares to solve
+        coeffs, residuals, rank, s = np.linalg.lstsq(X, T, rcond=None)
+        
+        if len(coeffs) >= 2:
+            a = float(coeffs[0])  # quadratic coefficient
+            b = float(coeffs[1])  # linear coefficient
+            c = float(coeffs[2]) if len(coeffs) > 2 else 0.0  # constant term
+            
+            # Ensure quadratic coefficient is non-negative
+            # (time should increase quadratically with seq_len due to attention)
+            if a < 0:
+                logger.warning(
+                    f"Fitted quadratic coefficient is negative ({a:.2e}), "
+                    "setting to 0.0. This may indicate insufficient or noisy data."
+                )
+                a = 0.0
+            
+            # Log fitting quality if residuals are available
+            if len(residuals) > 0:
+                mse = float(residuals[0] / len(L)) if len(L) > 0 else 0.0
+                logger.info(
+                    f"Quadratic fit: a={a:.2e}, b={b:.2e}, c={c:.2e}, "
+                    f"MSE={mse:.2e}"
+                )
+            
+            return (a, b)
+        else:
+            logger.warning("Failed to fit coefficients, insufficient data")
+            return (0.0, 0.0)
+    except np.linalg.LinAlgError as e:
+        logger.warning(f"Failed to fit quadratic coefficients: {e}")
+        return (0.0, 0.0)
